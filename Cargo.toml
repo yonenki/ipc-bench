@@ -1,0 +1,22 @@
+[package]
+name = "ipc-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+memmap2 = "0.9"
+tungstenite = "0.26"
+
+[[bin]]
+name = "ipc-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "ipc-client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "shm-playground"
+path = "src/bin/shm_playground.rs"
