@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::hint;
 use std::io;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -10,35 +11,124 @@ use memmap2::MmapMut;
 
 use super::{Role, Transport};
 
+// ---------------------------------------------------------------------------
+// リングヘッダのレイアウト定義
+// ---------------------------------------------------------------------------
+
+/// リングヘッダの共通インターフェース
+///
+/// write_cursor と read_cursor の配置方法を抽象化する。
+/// 実装ごとにメモリ上のオフセットが異なる。
+pub trait RingLayout: Send + 'static {
+    /// ヘッダ全体のサイズ (この後にリングデータが続く)
+    const HEADER_SIZE: usize;
+
+    /// write_cursor のヘッダ先頭からのオフセット
+    const WRITE_CURSOR_OFFSET: usize;
+
+    /// read_cursor のヘッダ先頭からのオフセット
+    const READ_CURSOR_OFFSET: usize;
+
+    /// レポート用の表示名サフィックス
+    const LABEL: &'static str;
+}
+
+/// Padded レイアウト: cache line (64byte) 分離
+///
+/// ```text
+/// offset 0:   write_cursor (AtomicU64)
+/// offset 8-63:  padding
+/// offset 64:  read_cursor (AtomicU64)
+/// offset 72-127: padding
+/// offset 128: ring data...
+/// ```
+///
+/// Writer と Reader が別コアで動く場合、同じキャッシュラインに
+/// 両カーソルがあると、片方が書くたびにもう片方のキャッシュが
+/// 無効化される (false sharing)。64byte 間隔に離すことで防止。
+#[repr(C, align(64))]
+pub struct CacheLineCursor {
+    pub value: AtomicU64,
+}
+
+#[repr(C)]
+pub struct PaddedHeader {
+    pub write_cursor: CacheLineCursor, // offset 0, size 64 (align 64)
+    pub read_cursor: CacheLineCursor,  // offset 64, size 64
+}
+
+pub struct PaddedLayout;
+
+impl RingLayout for PaddedLayout {
+    const HEADER_SIZE: usize = size_of::<PaddedHeader>(); // 128
+    const WRITE_CURSOR_OFFSET: usize = 0;
+    const READ_CURSOR_OFFSET: usize = 64;
+    const LABEL: &'static str = "SharedMem";
+}
+
+/// Compact レイアウト: パディングなし
+///
+/// ```text
+/// offset 0:  write_cursor (AtomicU64)
+/// offset 8:  read_cursor (AtomicU64)
+/// offset 16: ring data...
+/// ```
+///
+/// 同一キャッシュラインに両カーソルが乗るため false sharing が発生するが、
+/// ヘッダが小さい分メモリ効率が良い。比較用。
+#[repr(C)]
+pub struct CompactHeader {
+    pub write_cursor: AtomicU64, // offset 0
+    pub read_cursor: AtomicU64,  // offset 8
+}
+
+pub struct CompactLayout;
+
+impl RingLayout for CompactLayout {
+    const HEADER_SIZE: usize = size_of::<CompactHeader>(); // 16
+    const WRITE_CURSOR_OFFSET: usize = 0;
+    const READ_CURSOR_OFFSET: usize = 8;
+    const LABEL: &'static str = "SharedMem(compact)";
+}
+
+// ---------------------------------------------------------------------------
+// トランスポート本体
+// ---------------------------------------------------------------------------
+
+// 64MB に拡大したところ TLB ミス/キャッシュ効率低下で逆に悪化した。
+// 16MB がキャッシュ局所性と spin-wait 頻度のバランスが良い。
+const RING_DATA_SIZE: usize = 16 * 1024 * 1024; // 16MB
+const MSG_HEADER_SIZE: usize = 4;
+
 /// 共有メモリ上の SPSC リングバッファによるトランスポート
 ///
-/// メモリレイアウト (1方向分):
-///   offset 0:  write_cursor (AtomicU64) — 累積書き込みバイト数
-///   offset 8:  read_cursor  (AtomicU64) — 累積読み取りバイト数
-///   offset 16: ring data
+/// L: レイアウト (PaddedLayout or CompactLayout) で cache line パディングを切り替え
 ///
 /// 双方向通信のため、1ファイル内にリングを2本並べる:
 ///   [Ring A: Server→Client] [Ring B: Client→Server]
 ///
 /// カーソルは累積バイト数。実際の位置は cursor % RING_DATA_SIZE で求める。
 /// メッセージは 4byte LE length + payload のフレーミング。
-const RING_HEADER_SIZE: usize = 16; // write_cursor(8) + read_cursor(8)
-// 64MB に拡大したところ TLB ミス/キャッシュ効率低下で逆に悪化した。
-// 16MB がキャッシュ局所性と spin-wait 頻度のバランスが良い。
-const RING_DATA_SIZE: usize = 16 * 1024 * 1024; // 16MB
-const RING_TOTAL_SIZE: usize = RING_HEADER_SIZE + RING_DATA_SIZE;
-const SHM_SIZE: usize = RING_TOTAL_SIZE * 2; // 2リング分
-const MSG_HEADER_SIZE: usize = 4;
-
-pub struct SharedMemTransport {
+pub struct SharedMemTransport<L: RingLayout> {
     mmap: MmapMut,
     /// 自分が書くリングの先頭オフセット
     write_ring_offset: usize,
     /// 自分が読むリングの先頭オフセット
     read_ring_offset: usize,
+    _layout: PhantomData<L>,
 }
 
-impl SharedMemTransport {
+/// デフォルト: padded レイアウト
+pub type SharedMemPadded = SharedMemTransport<PaddedLayout>;
+/// 比較用: compact レイアウト (false sharing あり)
+pub type SharedMemCompact = SharedMemTransport<CompactLayout>;
+
+impl<L: RingLayout> SharedMemTransport<L> {
+    /// 1方向分のリングの合計サイズ
+    const RING_TOTAL_SIZE: usize = L::HEADER_SIZE + RING_DATA_SIZE;
+    /// 共有メモリ全体のサイズ (2リング分)
+    const SHM_SIZE: usize = Self::RING_TOTAL_SIZE * 2;
+
     fn shm_path(name: &str) -> PathBuf {
         PathBuf::from(format!("/dev/shm/ipc_bench_{}", name))
     }
@@ -51,19 +141,19 @@ impl SharedMemTransport {
     }
 
     fn write_cursor(&self) -> &AtomicU64 {
-        unsafe { Self::atomic_at(&self.mmap, self.write_ring_offset) }
+        unsafe { Self::atomic_at(&self.mmap, self.write_ring_offset + L::WRITE_CURSOR_OFFSET) }
     }
 
     fn write_read_cursor(&self) -> &AtomicU64 {
-        unsafe { Self::atomic_at(&self.mmap, self.write_ring_offset + 8) }
+        unsafe { Self::atomic_at(&self.mmap, self.write_ring_offset + L::READ_CURSOR_OFFSET) }
     }
 
     fn read_write_cursor(&self) -> &AtomicU64 {
-        unsafe { Self::atomic_at(&self.mmap, self.read_ring_offset) }
+        unsafe { Self::atomic_at(&self.mmap, self.read_ring_offset + L::WRITE_CURSOR_OFFSET) }
     }
 
     fn read_cursor(&self) -> &AtomicU64 {
-        unsafe { Self::atomic_at(&self.mmap, self.read_ring_offset + 8) }
+        unsafe { Self::atomic_at(&self.mmap, self.read_ring_offset + L::READ_CURSOR_OFFSET) }
     }
 
     /// リングバッファにデータを書く (wrap-around 対応)
@@ -76,7 +166,7 @@ impl SharedMemTransport {
     /// fn ring_write_bytes(&self, ring_offset: usize, cursor: u64, data: &[u8]) {
     ///     let base = self.mmap.as_ptr() as *mut u8;
     ///     for (i, &b) in data.iter().enumerate() {
-    ///         let pos = ring_offset + RING_HEADER_SIZE + ((cursor as usize + i) % RING_DATA_SIZE);
+    ///         let pos = ring_offset + HEADER_SIZE + ((cursor as usize + i) % RING_DATA_SIZE);
     ///         unsafe { base.add(pos).write_volatile(b) };
     ///     }
     /// }
@@ -86,15 +176,11 @@ impl SharedMemTransport {
     fn ring_write_bytes(&self, ring_offset: usize, cursor: u64, data: &[u8]) {
         let base = self.mmap.as_ptr() as *mut u8;
         let start = (cursor as usize) % RING_DATA_SIZE;
-        let ring_start = ring_offset + RING_HEADER_SIZE;
+        let ring_start = ring_offset + L::HEADER_SIZE;
 
         let first_len = data.len().min(RING_DATA_SIZE - start);
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                base.add(ring_start + start),
-                first_len,
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), base.add(ring_start + start), first_len);
         }
         // wrap-around: 残りがあればリング先頭にコピー
         if first_len < data.len() {
@@ -118,7 +204,7 @@ impl SharedMemTransport {
     fn ring_read_bytes(&self, ring_offset: usize, cursor: u64, buf: &mut [u8]) {
         let base = self.mmap.as_ptr();
         let start = (cursor as usize) % RING_DATA_SIZE;
-        let ring_start = ring_offset + RING_HEADER_SIZE;
+        let ring_start = ring_offset + L::HEADER_SIZE;
 
         let first_len = buf.len().min(RING_DATA_SIZE - start);
         unsafe {
@@ -141,7 +227,7 @@ impl SharedMemTransport {
     }
 }
 
-impl Transport for SharedMemTransport {
+impl<L: RingLayout> Transport for SharedMemTransport<L> {
     fn open(name: &str, role: Role) -> io::Result<Self> {
         let path = Self::shm_path(name);
 
@@ -153,35 +239,35 @@ impl Transport for SharedMemTransport {
                     .create(true)
                     .truncate(true)
                     .open(&path)?;
-                file.set_len(SHM_SIZE as u64)?;
+                file.set_len(Self::SHM_SIZE as u64)?;
 
                 let mmap = unsafe { MmapMut::map_mut(&file)? };
 
                 // 全カーソルを 0 に初期化
-                let wc_a = unsafe { Self::atomic_at(&mmap, 0) };
-                let rc_a = unsafe { Self::atomic_at(&mmap, 8) };
-                let wc_b = unsafe { Self::atomic_at(&mmap, RING_TOTAL_SIZE) };
-                let rc_b = unsafe { Self::atomic_at(&mmap, RING_TOTAL_SIZE + 8) };
+                let wc_a = unsafe { Self::atomic_at(&mmap, L::WRITE_CURSOR_OFFSET) };
+                let rc_a = unsafe { Self::atomic_at(&mmap, L::READ_CURSOR_OFFSET) };
+                let wc_b =
+                    unsafe { Self::atomic_at(&mmap, Self::RING_TOTAL_SIZE + L::WRITE_CURSOR_OFFSET) };
+                let rc_b =
+                    unsafe { Self::atomic_at(&mmap, Self::RING_TOTAL_SIZE + L::READ_CURSOR_OFFSET) };
                 wc_a.store(0, Ordering::Release);
                 rc_a.store(0, Ordering::Release);
                 wc_b.store(0, Ordering::Release);
                 rc_b.store(0, Ordering::Release);
 
-                // Server: Ring A (offset 0) に書く、Ring B (offset RING_TOTAL_SIZE) から読む
                 Ok(Self {
                     mmap,
                     write_ring_offset: 0,
-                    read_ring_offset: RING_TOTAL_SIZE,
+                    read_ring_offset: Self::RING_TOTAL_SIZE,
+                    _layout: PhantomData,
                 })
             }
             Role::Client => {
-                // Server がファイルを作るのを待つ
                 let mut retries = 0;
                 loop {
                     if Path::new(&path).exists() {
-                        // サイズが確定するまで少し待つ
                         if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
-                            >= SHM_SIZE as u64
+                            >= Self::SHM_SIZE as u64
                         {
                             break;
                         }
@@ -199,11 +285,11 @@ impl Transport for SharedMemTransport {
                 let file = OpenOptions::new().read(true).write(true).open(&path)?;
                 let mmap = unsafe { MmapMut::map_mut(&file)? };
 
-                // Client: Ring B (offset RING_TOTAL_SIZE) に書く、Ring A (offset 0) から読む
                 Ok(Self {
                     mmap,
-                    write_ring_offset: RING_TOTAL_SIZE,
+                    write_ring_offset: Self::RING_TOTAL_SIZE,
                     read_ring_offset: 0,
+                    _layout: PhantomData,
                 })
             }
         }
@@ -296,6 +382,6 @@ impl Transport for SharedMemTransport {
     }
 
     fn transport_name() -> &'static str {
-        "SharedMem"
+        L::LABEL
     }
 }

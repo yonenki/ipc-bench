@@ -2,7 +2,7 @@ use clap::Parser;
 use std::time::Instant;
 
 use ipc_bench::transport::named_pipe::NamedPipeTransport;
-use ipc_bench::transport::shared_mem::SharedMemTransport;
+use ipc_bench::transport::shared_mem::{SharedMemCompact, SharedMemPadded};
 use ipc_bench::transport::tcp_socket::TcpSocketTransport;
 use ipc_bench::transport::unix_socket::UnixSocketTransport;
 use ipc_bench::transport::websocket::WebSocketTransport;
@@ -88,7 +88,8 @@ fn main() {
         "tcp_socket" => run_ping_pong::<TcpSocketTransport>(&args.name, args.size, args.count),
         "websocket" => run_ping_pong::<WebSocketTransport>(&args.name, args.size, args.count),
         "named_pipe" => run_ping_pong::<NamedPipeTransport>(&args.name, args.size, args.count),
-        "shared_mem" => run_ping_pong::<SharedMemTransport>(&args.name, args.size, args.count),
+        "shared_mem" => run_ping_pong::<SharedMemPadded>(&args.name, args.size, args.count),
+        "shared_mem_compact" => run_ping_pong::<SharedMemCompact>(&args.name, args.size, args.count),
         other => {
             eprintln!("Unknown transport: {}", other);
             std::process::exit(1);

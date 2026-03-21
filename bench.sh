@@ -9,7 +9,7 @@
 
 set -e
 
-TRANSPORTS="shared_mem named_pipe unix_socket tcp_socket websocket"
+TRANSPORTS="shared_mem shared_mem_compact named_pipe unix_socket tcp_socket websocket"
 
 run_scenario() {
     local label="$1"
