@@ -9,12 +9,15 @@
 
 set -e
 
-# SharedMem バリエーション:
-#   shared_mem          - padded, 2回コピー (baseline)
-#   shared_mem_compact  - compact (false sharing あり)
-#   shared_mem_uninit1k - padded, inline MaybeUninit (1KB閾値)
-#   shared_mem_inline1k - padded, inline ゼロ初期化 (1KB閾値, 比較用)
-TRANSPORTS="shared_mem shared_mem_compact shared_mem_uninit1k shared_mem_inline1k named_pipe unix_socket tcp_socket websocket"
+# SharedMem 検証マトリクス (2軸 × 2値 = 4パターン):
+#   HeaderLayout: padded (cache line分離) / compact (false sharing)
+#   FrameStrategy: twocopy (2回コピー) / uninit1k (MaybeUninit inline)
+#
+#   shared_mem                - [padded,  twocopy]  (baseline)
+#   shared_mem_compact        - [compact, twocopy]
+#   shared_mem_uninit1k       - [padded,  uninit1k]
+#   shared_mem_compact_uninit1k - [compact, uninit1k]
+TRANSPORTS="shared_mem shared_mem_compact shared_mem_uninit1k shared_mem_compact_uninit1k named_pipe unix_socket tcp_socket websocket"
 
 ROUNDS=5
 WARMUP=100

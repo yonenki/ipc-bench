@@ -5,18 +5,37 @@
 Rust で複数の IPC トランスポートを実装し、PingPong (送信→エコー→受信) パターンで
 レイテンシとスループットを計測した。
 
-### トランスポート一覧
+SharedMem は2つの独立した最適化軸をジェネリクスで直積化し、
+各軸の効果を独立に検証できる設計になっている。
 
-| Transport | 方式 | syscall/msg | 特徴 |
-|-----------|------|-------------|------|
-| **SharedMem** | mmap + SPSC lock-free ring buffer | **0** | AtomicU64 カーソル + spin-wait, cache line padded |
-| **SharedMem(uninit1k)** | 同上 + MaybeUninit inline frame | **0** | 1KB以下のメッセージで初期化スキップ |
-| **SharedMem(inline1k)** | 同上 + ゼロ初期化 inline frame | **0** | uninit との比較用 |
-| **SharedMem(compact)** | 同上、パディングなし | **0** | false sharing 比較用 |
-| **NamedPipe** | FIFO 2本 (双方向) | 2 (read+write) | BufWriter で write を1回にまとめ |
-| **UnixSocket** | Unix domain socket (SOCK_STREAM) | 2 (read+write) | length-prefix フレーミング |
-| **TcpSocket** | TCP localhost (127.0.0.1) | 2 (read+write) | set_nodelay + BufWriter |
-| **WebSocket** | tungstenite over TCP | 2 (read+write) | フレーミング/マスキングのオーバーヘッドあり |
+## トランスポート一覧
+
+### Socket / Pipe 系
+
+| Transport | 方式 | syscall/msg |
+|-----------|------|-------------|
+| NamedPipe | FIFO 2本 (双方向) | 2 (read+write) |
+| UnixSocket | Unix domain socket (SOCK_STREAM) | 2 (read+write) |
+| TcpSocket | TCP localhost, set_nodelay + BufWriter | 2 (read+write) |
+| WebSocket | tungstenite over TCP | 2 (read+write) |
+
+### SharedMem 系 — `SharedMemTransport<H, F>` の直積
+
+| 表記 | HeaderLayout (H) | FrameStrategy (F) | 特徴 |
+|------|------|------|------|
+| `SharedMem[padded]` | Padded | TwoCopy | **baseline**: cache line 分離 + 2回コピー |
+| `SharedMem[compact]` | Compact | TwoCopy | false sharing あり (H軸の効果を見る) |
+| `SharedMem[padded,(uninit1k)]` | Padded | InlineUninit<1028> | MaybeUninit inline frame (F軸の効果を見る) |
+| `SharedMem[compact,(uninit1k)]` | Compact | InlineUninit<1028> | 両軸の組み合わせ |
+
+**検証軸:**
+- **HeaderLayout 軸**: `Padded` (cache line 64byte 分離) vs `Compact` (8byte 隣接)
+  → false sharing の影響を測定
+- **FrameStrategy 軸**: `TwoCopy` (length と payload を2回に分けてコピー) vs `InlineUninit` (MaybeUninit スタックバッファに結合して1回コピー)
+  → フレーム結合 + ゼロ初期化スキップの効果を測定
+
+全バリエーションは `SharedMemTransport<H, F>` の型パラメータで表現され、
+`#[inline(always)]` + const 分岐によりコンパイル時に不要パスが除去される（ゼロコスト抽象化）。
 
 ## 環境
 
@@ -36,60 +55,59 @@ Rust で複数の IPC トランスポートを実装し、PingPong (送信→エ
 
 ### Scenario 1: 高頻度小メッセージ (64B x 100,000)
 
-小さなメッセージを大量にやり取りするケース。制御コマンド送受信などを想定。
+| Transport | p50 | p95 | p99 | Throughput |
+|-----------|-----|-----|-----|------------|
+| **SharedMem[padded]** | **190ns** | **220ns** | **4.06µs** | **418 MB/s** |
+| SharedMem[compact,(uninit1k)] | 692ns | 801ns | 3.91µs | 152 MB/s |
+| SharedMem[padded,(uninit1k)] | 1.12µs | 1.46µs | 6.11µs | 94 MB/s |
+| SharedMem[compact] | 1.65µs | 1.85µs | 6.11µs | 67 MB/s |
+| NamedPipe | 12.07µs | 14.84µs | 18.11µs | 9.74 MB/s |
+| UnixSocket | 12.94µs | 17.11µs | 26.23µs | 8.97 MB/s |
+| TcpSocket | 18.86µs | 22.77µs | 34.13µs | 6.20 MB/s |
+| WebSocket | 19.14µs | 28.50µs | 40.62µs | 5.87 MB/s |
 
-| Transport | p50 | p95 | p99 | max | Throughput |
-|-----------|-----|-----|-----|-----|------------|
-| **SharedMem(uninit1k)** | **581ns** | **881ns** | **4.57µs** | 411µs | **170 MB/s** |
-| SharedMem(compact) | 712ns | 1.62µs | 4.13µs | 34µs | 136 MB/s |
-| SharedMem(inline1k) | 882ns | 1.17µs | 5.53µs | 21µs | 117 MB/s |
-| SharedMem (baseline) | 1.20µs | 1.57µs | 6.44µs | 64µs | 90 MB/s |
-| NamedPipe | 12.85µs | 16.92µs | 21.39µs | 577µs | 9.01 MB/s |
-| UnixSocket | 13.43µs | 16.87µs | 22.61µs | 449µs | 8.67 MB/s |
-| WebSocket | 19.28µs | 26.44µs | 31.82µs | 438µs | 5.86 MB/s |
-| TcpSocket | 20.08µs | 29.57µs | 34.06µs | 463µs | 5.65 MB/s |
+**SharedMem[padded] が p50 190ns で最速**。NamedPipe の 63 倍、TCP の 100 倍速い。
 
-**SharedMem(uninit1k) が他トランスポートの 19〜30 倍速い**。
+SharedMem 軸分析 (64B):
 
-SharedMem バリエーション間の比較:
-- **uninit vs inline**: MaybeUninit によるゼロ初期化スキップで 882ns → 581ns (34%改善)
-- **padded vs compact**: cache line パディングで p99 が 4.13µs vs 6.44µs
-- **baseline**: 2回コピーが最もシンプルだがオーバーヘッドがある
+| | TwoCopy | InlineUninit 1k |
+|---|---|---|
+| **Padded** | **190ns** | 1.12µs |
+| **Compact** | 1.65µs | 692ns |
+
+→ 64B ではフレーム結合のオーバーヘッドが TwoCopy のシンプルさに勝てない。Padded+TwoCopy が最速。
 
 ### Scenario 2: 大容量転送 (1MB x 100)
 
-画像やバイナリデータの転送を想定。
+| Transport | p50 | p95 | Throughput |
+|-----------|-----|-----|------------|
+| **SharedMem[padded]** | **398µs** | 721µs | **4,473 MB/s** |
+| SharedMem[compact] | 409µs | 666µs | 4,546 MB/s |
+| TcpSocket | 435µs | 612µs | 4,484 MB/s |
+| SharedMem[padded,(uninit1k)] | 477µs | 893µs | 3,786 MB/s |
+| SharedMem[compact,(uninit1k)] | 509µs | 656µs | 3,805 MB/s |
+| UnixSocket | 687µs | 1.08ms | 3,099 MB/s |
+| NamedPipe | 1.07ms | 1.60ms | 1,763 MB/s |
+| WebSocket | 2.15ms | 3.04ms | 898 MB/s |
 
-| Transport | p50 | p95 | p99 | Throughput |
-|-----------|-----|-----|-----|------------|
-| UnixSocket | 462µs | 736µs | 1.84ms | **3,986 MB/s** |
-| TcpSocket | 600µs | 797µs | 1.11ms | 3,209 MB/s |
-| SharedMem(compact) | 802µs | 1.18ms | 1.25ms | 2,372 MB/s |
-| SharedMem(inline1k) | 794µs | 1.24ms | 1.40ms | 2,372 MB/s |
-| SharedMem(uninit1k) | 812µs | 1.20ms | 1.27ms | 2,321 MB/s |
-| SharedMem (baseline) | 819µs | 1.44ms | 1.62ms | 2,206 MB/s |
-| NamedPipe | 1.10ms | 1.64ms | 2.22ms | 1,704 MB/s |
-| WebSocket | 2.18ms | 3.00ms | 3.55ms | 905 MB/s |
-
-大容量ではカーネルの最適化された memcpy を使う UnixSocket/TcpSocket がスループットで上回る。
-inline/uninit の差は 1MB では閾値 (1KB) を超えるため出ない。
+1MB ではすべての SharedMem バリエーションが高速。
+inline 閾値 (1KB) を超えるため InlineUninit は TwoCopy にフォールバックするが、
+関数呼び出し分岐のわずかなオーバーヘッドが見える。
 
 ### Scenario 3: 超大容量転送 (10MB x 20)
 
-大規模データの一括転送を想定。
-
 | Transport | p50 | p95 | Throughput |
 |-----------|-----|-----|------------|
-| **SharedMem(uninit1k)** | **3.95ms** | 5.24ms | **5,074 MB/s** |
-| SharedMem(inline1k) | 3.96ms | 4.97ms | 5,023 MB/s |
-| SharedMem(compact) | 3.97ms | 5.06ms | 5,002 MB/s |
-| SharedMem (baseline) | 4.08ms | 4.76ms | 4,971 MB/s |
-| TcpSocket | 5.68ms | 7.51ms | 3,401 MB/s |
-| UnixSocket | 5.85ms | 6.65ms | 3,337 MB/s |
-| NamedPipe | 14.86ms | 15.52ms | 1,361 MB/s |
-| WebSocket | 27.52ms | 32.50ms | 718 MB/s |
+| **SharedMem[padded,(uninit1k)]** | **3.67ms** | 5.06ms | **5,263 MB/s** |
+| SharedMem[padded] | 3.77ms | 5.01ms | 5,213 MB/s |
+| SharedMem[compact] | 3.77ms | 4.86ms | 5,169 MB/s |
+| SharedMem[compact,(uninit1k)] | 3.79ms | 4.74ms | 5,093 MB/s |
+| TcpSocket | 5.57ms | 6.56ms | 3,501 MB/s |
+| UnixSocket | 6.18ms | 7.79ms | 3,259 MB/s |
+| NamedPipe | 14.49ms | 15.91ms | 1,377 MB/s |
+| WebSocket | 27.87ms | 32.19ms | 728 MB/s |
 
-ウォームアップにより SharedMem が **5 GB/s** に到達。10MB は 16MB リングに収まるため
+全 SharedMem が **5 GB/s 超**。10MB はリングバッファ (16MB) に収まるため、
 syscall ゼロ + memcpy の効率が最大限活きる。
 
 ---
@@ -99,31 +117,29 @@ syscall ゼロ + memcpy の効率が最大限活きる。
 ### レイテンシ階層構造
 
 ```
-メモリ読み書き (uninit)    ~581ns    SharedMem(uninit1k)
-メモリ読み書き (padded)    ~712ns    SharedMem(compact)
-メモリ読み書き (baseline)  ~1.2µs    SharedMem
-  + syscall (read/write)    ~13µs    NamedPipe / UnixSocket
-  + TCP/IP スタック          ~20µs    TcpSocket / WebSocket
+メモリ読み書きのみ         ~190ns    SharedMem[padded]
+  + false sharing          ~1.6µs    SharedMem[compact]
+  + syscall (read/write)    ~12µs    NamedPipe / UnixSocket
+  + TCP/IP スタック          ~19µs    TcpSocket / WebSocket
 ```
 
 ### ワークロード別の最適解
 
 | ワークロード | 最適な Transport | 理由 |
 |-------------|-----------------|------|
-| 高頻度・小メッセージ | **SharedMem(uninit1k)** | syscall ゼロ + MaybeUninit で sub-µs |
-| 大容量バルク転送 | **UnixSocket** | カーネルの最適化された memcpy |
-| 超大容量 (リングに収まるサイズ) | **SharedMem** | 5 GB/s、syscall ゼロの真価 |
-| バランス型 | **SharedMem** | 全シナリオで上位 |
-| クロスマシン必要 | **TcpSocket** | ネットワーク越しに使える唯一の選択肢 |
+| 高頻度・小メッセージ | **SharedMem[padded]** | syscall ゼロ、sub-µs |
+| 大容量バルク転送 | **SharedMem[padded] / TcpSocket** | 4.4~4.5 GB/s で互角 |
+| 超大容量 | **SharedMem** (全バリエーション) | 5+ GB/s |
+| クロスマシン | **TcpSocket** | ネットワーク越し唯一 |
 
 ### 実装で得た知見
 
-1. **syscall は1回あたり ~10µs のコスト**がある
-   - TCP の素朴な実装 (write_all 2回) が WebSocket より遅かった原因
-   - BufWriter で write をまとめることで改善
+1. **syscall は1回あたり ~10µs のコスト**
+   - TCP の素朴な実装 (write_all 2回) が WebSocket より遅かった
+   - BufWriter で write をまとめて改善
 
-2. **SharedMem のリングバッファサイズは大きすぎてもダメ**
-   - 16MB → 64MB に拡大したら TLB ミス/キャッシュ効率低下で逆に悪化
+2. **リングバッファサイズは大きすぎてもダメ**
+   - 16MB → 64MB で TLB ミス/キャッシュ効率低下により逆に悪化
    - CPU キャッシュとの局所性が重要
 
 3. **1バイトずつ write_volatile vs copy_nonoverlapping**
@@ -132,23 +148,54 @@ syscall ゼロ + memcpy の効率が最大限活きる。
 
 4. **Atomic の Acquire/Release は x86 ではほぼゼロコスト**
    - x86 は TSO (Total Store Order) なのでコンパイラバリアだけで済む
-   - SharedMem の spin-wait ループで Atomic load が高速に動く理由
 
-5. **Cache line パディングによる false sharing 防止**
-   - write_cursor と read_cursor を別キャッシュライン (64byte) に配置
-   - `#[repr(C, align(64))]` でコンパイラがパディングを保証
-   - RingLayout trait でレイアウトをジェネリクス化し型パラメータで切り替え可能
+5. **Cache line パディングの効果**
+   - `#[repr(C, align(64))]` で write_cursor / read_cursor を分離
+   - Compact との比較で false sharing の影響が定量化できた
 
-6. **MaybeUninit によるゼロ初期化スキップ**
-   - inline frame で length + payload をまとめる際、`[0u8; N]` のゼロクリアがボトルネック
-   - `MaybeUninit::uninit()` + `copy_nonoverlapping` で初期化をスキップ
-   - 64B メッセージで 882ns → 581ns (34%改善)
-   - 閾値が大きすぎる (8KB) とゼロ初期化コストが支配的になり逆効果
+6. **MaybeUninit の効果と限界**
+   - inline frame のゼロ初期化 (`[0u8; N]`) がボトルネックになるケースで有効
+   - ただし 64B のような極小メッセージでは TwoCopy の方がシンプルで速い
+   - フレーム結合のメリットは中サイズ (数百B〜数KB) で出る
 
 7. **ウォームアップと複数ラウンドの重要性**
-   - キャッシュが冷えた状態の初回は 2 倍近く遅い
-   - 1回計測では CPU クロック変動・スケジューラノイズで結果がブレる
+   - キャッシュが冷えた状態の初回は数倍遅い
    - 5ラウンド中央値 + 100回ウォームアップで安定した計測が可能に
+
+8. **ゼロコスト抽象化による検証軸の設計**
+   - `HeaderLayout` と `FrameStrategy` を独立した trait で定義
+   - `SharedMemTransport<H, F>` の型パラメータで直積化
+   - const 分岐 + `#[inline(always)]` でランタイムコストなし
+   - `dispatch_transport!` マクロでバリエーション追加が1行
+
+---
+
+## アーキテクチャ
+
+### SharedMem の型構造
+
+```
+SharedMemTransport<H: HeaderLayout, F: FrameStrategy>
+    │
+    ├── HeaderLayout (軸1: カーソル配置)
+    │   ├── Padded   — #[repr(C, align(64))] で cache line 分離
+    │   └── Compact  — 8byte 隣接 (false sharing)
+    │
+    ├── FrameStrategy (軸2: フレーム結合方式)
+    │   ├── TwoCopy        — length + payload を2回に分けてコピー
+    │   ├── InlineZeroed<N> — ゼロ初期化バッファに結合して1回コピー
+    │   └── InlineUninit<N> — MaybeUninit で初期化スキップ
+    │
+    └── RingOps — mmap 上の read/write 操作 (wrap-around 対応)
+```
+
+### バリエーション追加手順
+
+1. `shared_mem.rs`: `pub type` を1行追加
+2. `lib.rs`: `dispatch_transport!` マクロに1行追加
+3. `bench.sh`: `TRANSPORTS` に追加
+
+server / client のコードは変更不要。
 
 ---
 
@@ -166,13 +213,7 @@ cargo build --release
 ./bench.sh large     # 大容量 (1MB) のみ
 ./bench.sh vlarge    # 超大容量 (10MB) のみ
 
-# 手動実行 (カスタムパラメータ)
+# 手動実行
 cargo run --release --bin ipc-server -- -t shared_mem --count 5100 &
 cargo run --release --bin ipc-client -- -t shared_mem --count 1000 --size 64 --rounds 5 --warmup 100
-
-# SharedMem バリエーション
-#   shared_mem          - padded, 2回コピー (baseline)
-#   shared_mem_compact  - compact (false sharing あり)
-#   shared_mem_uninit1k - padded + MaybeUninit inline (1KB閾値, 最速)
-#   shared_mem_inline1k - padded + ゼロ初期化 inline (1KB閾値, 比較用)
 ```
