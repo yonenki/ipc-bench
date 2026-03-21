@@ -9,20 +9,29 @@
 
 set -e
 
-TRANSPORTS="shared_mem shared_mem_compact named_pipe unix_socket tcp_socket websocket"
+# SharedMem バリエーション:
+#   shared_mem          - padded, 2回コピー (baseline)
+#   shared_mem_compact  - compact (false sharing あり)
+#   shared_mem_uninit1k - padded, inline MaybeUninit (1KB閾値)
+#   shared_mem_inline1k - padded, inline ゼロ初期化 (1KB閾値, 比較用)
+TRANSPORTS="shared_mem shared_mem_compact shared_mem_uninit1k shared_mem_inline1k named_pipe unix_socket tcp_socket websocket"
+
+ROUNDS=5
+WARMUP=100
 
 run_scenario() {
     local label="$1"
     local size="$2"
     local count="$3"
+    local total_msgs=$(( WARMUP + ROUNDS * count ))
 
     echo "========================================="
-    echo " $label (size=${size}B x ${count})"
+    echo " $label (size=${size}B x ${count}, ${ROUNDS} rounds, warmup=${WARMUP})"
     echo "========================================="
     for t in $TRANSPORTS; do
-        cargo run --release --bin ipc-server -- -t "$t" --count "$count" &
+        cargo run --release --bin ipc-server -- -t "$t" --count "$total_msgs" &
         sleep 0.3
-        cargo run --release --bin ipc-client -- -t "$t" --count "$count" --size "$size" 2>&1
+        cargo run --release --bin ipc-client -- -t "$t" --count "$count" --size "$size" --rounds "$ROUNDS" --warmup "$WARMUP" 2>&1
         wait
         echo ""
     done
