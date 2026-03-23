@@ -1,0 +1,61 @@
+name: IPC Benchmark
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            transports: "shared_mem shared_mem_compact shared_mem_uninit1k shared_mem_compact_uninit1k named_pipe unix_socket tcp_socket websocket"
+          - os: windows-latest
+            transports: "shared_mem shared_mem_compact shared_mem_uninit1k shared_mem_compact_uninit1k named_pipe tcp_socket websocket"
+
+    runs-on: ${{ matrix.os }}
+    name: Bench (${{ matrix.os }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Run benchmarks
+        shell: bash
+        env:
+          TRANSPORTS: ${{ matrix.transports }}
+          ROUNDS: "5"
+          WARMUP: "100"
+        run: |
+          run_scenario() {
+            local label="$1"
+            local size="$2"
+            local count="$3"
+            local total_msgs=$(( WARMUP + ROUNDS * count ))
+
+            echo "========================================="
+            echo " $label (size=${size}B x ${count}, ${ROUNDS} rounds, warmup=${WARMUP})"
+            echo "========================================="
+            for t in $TRANSPORTS; do
+              echo "--- $t ---"
+              cargo run --release --bin ipc-server -- -t "$t" --count "$total_msgs" &
+              SERVER_PID=$!
+              sleep 1
+              cargo run --release --bin ipc-client -- -t "$t" --count "$count" --size "$size" --rounds "$ROUNDS" --warmup "$WARMUP"
+              wait $SERVER_PID
+              echo ""
+            done
+          }
+
+          run_scenario "High Frequency" 64 100000
+          run_scenario "Large Payload (1MB)" 1048576 100
+          run_scenario "Very Large Payload (10MB)" 10485760 20

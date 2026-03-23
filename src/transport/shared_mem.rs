@@ -364,7 +364,17 @@ impl<H: HeaderLayout, F: FrameStrategy> SharedMemTransport<H, F> {
     const SHM_SIZE: usize = Self::RING_TOTAL_SIZE * 2;
 
     fn shm_path(name: &str) -> PathBuf {
-        PathBuf::from(format!("/dev/shm/ipc_bench_{}", name))
+        // Linux: /dev/shm/ は tmpfs (RAM上) なのでディスクI/Oが発生しない
+        // Windows: %TEMP% を使用。ディスク上だが memmap2 が
+        //          CreateFileMapping + MapViewOfFile でメモリマップする
+        #[cfg(target_os = "linux")]
+        {
+            PathBuf::from(format!("/dev/shm/ipc_bench_{}", name))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::env::temp_dir().join(format!("ipc_bench_{}", name))
+        }
     }
 
     unsafe fn atomic_at(mmap: &MmapMut, offset: usize) -> &AtomicU64 {

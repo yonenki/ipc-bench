@@ -1,6 +1,10 @@
+#[cfg(unix)]
 pub mod named_pipe;
+#[cfg(windows)]
+pub mod named_pipe_win;
 pub mod shared_mem;
 pub mod tcp_socket;
+#[cfg(unix)]
 pub mod unix_socket;
 pub mod websocket;
 

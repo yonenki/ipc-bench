@@ -4,15 +4,25 @@ pub mod transport;
 ///
 /// 新しい Transport / SharedMem バリエーションを追加する際、ここに1行足すだけでよい。
 /// server / client の match 分岐が自動的に揃う。
+///
+/// プラットフォーム固有のトランスポートは #[cfg] でゲートされる。
 #[macro_export]
 macro_rules! dispatch_transport {
     ($transport_str:expr, $func:ident ( $($arg:expr),* $(,)? )) => {
         match $transport_str {
-            // --- Socket / Pipe ---
-            "unix_socket" => $func::<$crate::transport::unix_socket::UnixSocketTransport>($($arg),*),
+            // --- クロスプラットフォーム ---
             "tcp_socket"  => $func::<$crate::transport::tcp_socket::TcpSocketTransport>($($arg),*),
             "websocket"   => $func::<$crate::transport::websocket::WebSocketTransport>($($arg),*),
+
+            // --- Unix 固有 ---
+            #[cfg(unix)]
+            "unix_socket" => $func::<$crate::transport::unix_socket::UnixSocketTransport>($($arg),*),
+            #[cfg(unix)]
             "named_pipe"  => $func::<$crate::transport::named_pipe::NamedPipeTransport>($($arg),*),
+
+            // --- Windows 固有 ---
+            #[cfg(windows)]
+            "named_pipe"  => $func::<$crate::transport::named_pipe_win::WinNamedPipeTransport>($($arg),*),
 
             // --- SharedMem: 検証マトリクス (HeaderLayout × FrameStrategy) ---
             "shared_mem"                  => $func::<$crate::transport::shared_mem::SharedMemPadded>($($arg),*),
