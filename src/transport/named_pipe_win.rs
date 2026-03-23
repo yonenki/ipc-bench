@@ -25,7 +25,10 @@ impl WinNamedPipeTransport {
 
 impl Transport for WinNamedPipeTransport {
     fn open(name: &str, role: Role) -> io::Result<Self> {
-        use windows_sys::Win32::Storage::FileSystem::*;
+        use INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING,
+        };
         use windows_sys::Win32::System::Pipes::*;
 
         let pipe_name = Self::pipe_name(name);
@@ -42,10 +45,10 @@ impl Transport for WinNamedPipeTransport {
                         64 * 1024,  // out buffer size
                         64 * 1024,  // in buffer size
                         0,          // default timeout
-                        std::ptr::null(),
+                        std::ptr::null(), // security attributes
                     )
                 };
-                if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                if handle == INVALID_HANDLE_VALUE {
                     return Err(io::Error::last_os_error());
                 }
 
@@ -73,10 +76,10 @@ impl Transport for WinNamedPipeTransport {
                             std::ptr::null(),
                             OPEN_EXISTING,
                             0,
-                            std::ptr::null_mut(),
+                            0, // template file handle (unused)
                         )
                     };
-                    if handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                    if handle != INVALID_HANDLE_VALUE {
                         let pipe = unsafe { File::from_raw_handle(handle as _) };
                         return Ok(Self { pipe });
                     }
