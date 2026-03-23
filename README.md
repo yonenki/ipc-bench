@@ -149,9 +149,19 @@ syscall ゼロ + memcpy の効率が最大限活きる。
 4. **Atomic の Acquire/Release は x86 ではほぼゼロコスト**
    - x86 は TSO (Total Store Order) なのでコンパイラバリアだけで済む
 
-5. **Cache line パディングの効果**
-   - `#[repr(C, align(64))]` で write_cursor / read_cursor を分離
-   - Compact との比較で false sharing の影響が定量化できた
+5. **Cache line パディングと CPU コア配置の関係**
+   - `#[repr(C, align(64))]` で write_cursor / read_cursor を別キャッシュラインに分離
+   - `taskset` でコア配置を固定して false sharing の効果を検証:
+
+   | 配置 | Padded p50 | Compact p50 | 備考 |
+   |------|-----------|------------|------|
+   | 同一物理コア (SMT) | 90ns | 100ns | L1 共有のため差なし |
+   | 別物理コア | 190ns | 221ns | MESI Invalidate で 14% の差 |
+   | OS 任せ | 190ns | **701ns** | スケジューラ次第で 7 倍悪化 |
+
+   - SMT ペアは L1 キャッシュを物理的に共有するため、false sharing のペナルティ (MESI Invalidate) が発生しない
+   - CI の VM で Padded の効果が出なかったのは、vCPU が同一物理コアの SMT ペアだったため
+   - **Padded の本当の価値は OS 任せの環境での安定性** — Compact はスケジューラに依存して不安定
 
 6. **MaybeUninit の効果と限界**
    - inline frame のゼロ初期化 (`[0u8; N]`) がボトルネックになるケースで有効
@@ -162,7 +172,13 @@ syscall ゼロ + memcpy の効率が最大限活きる。
    - キャッシュが冷えた状態の初回は数倍遅い
    - 5ラウンド中央値 + 100回ウォームアップで安定した計測が可能に
 
-8. **ゼロコスト抽象化による検証軸の設計**
+8. **クロスプラットフォーム検証 (GitHub Actions)**
+   - Linux / Windows で全トランスポートのベンチマークを CI で自動実行
+   - SharedMem: Linux は `/dev/shm/` (tmpfs)、Windows は `%TEMP%` + `memmap2`
+   - NamedPipe: Linux は FIFO 2本、Windows は `CreateNamedPipeW` (双方向)
+   - Windows の NamedPipe が大容量で 6.5~7 GB/s と Linux FIFO (1 GB/s) の 7 倍速い
+
+9. **ゼロコスト抽象化による検証軸の設計**
    - `HeaderLayout` と `FrameStrategy` を独立した trait で定義
    - `SharedMemTransport<H, F>` の型パラメータで直積化
    - const 分岐 + `#[inline(always)]` でランタイムコストなし
