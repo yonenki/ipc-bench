@@ -78,7 +78,7 @@ impl Transport for WinNamedPipeTransport {
                             std::ptr::null(),
                             OPEN_EXISTING,
                             0,
-                            0, // template file handle (unused)
+                            std::ptr::null_mut(), // template file handle (unused)
                         )
                     };
                     if handle != INVALID_HANDLE_VALUE {
