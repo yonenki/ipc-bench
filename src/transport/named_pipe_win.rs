@@ -25,11 +25,13 @@ impl WinNamedPipeTransport {
 
 impl Transport for WinNamedPipeTransport {
     fn open(name: &str, role: Role) -> io::Result<Self> {
-        use INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING,
+            CreateFileW, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
         };
-        use windows_sys::Win32::System::Pipes::*;
+        use windows_sys::Win32::System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+        };
 
         let pipe_name = Self::pipe_name(name);
         let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
